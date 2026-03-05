@@ -432,26 +432,30 @@ var p_types = {
     "PT_HIPROC": 0x7fffffff,	/* End of processor-specific */
 }
 
-function getExportFunction(name, ret, args) {
-    var funcPtr;
-    funcPtr = Module.findExportByName(null, name);
-    if (funcPtr === null) {
-        console.log("cannot find " + name);
-        return null;
-    } else {
-        var func = new NativeFunction(funcPtr, ret, args);
-        if (typeof func === "undefined") {
-            console.log("parse error " + name);
+function getExportFunction(name, retType, argTypes) {
+    try {
+        const funcPtr = Module.findExportByName(null, name);
+
+        if (!funcPtr || funcPtr.isNull()) {
+            console.error(`[-] Cannot find export: ${name}`);
             return null;
         }
-        return func;
+
+        console.log(`[*] Found export ${name} at ${funcPtr}`);
+        return new NativeFunction(funcPtr, retType, argTypes);
+    } catch (err) {
+        console.error(`[-] Failed to create NativeFunction for ${name}: ${err}`);
+        return null;
     }
 }
 
-var open = getExportFunction("open", "int", ["pointer", "int", "int"])
-var close = getExportFunction("close", "int", ["int"]);
-var lseek = getExportFunction("lseek", "int", ["int", "int", "int"]);
-var read = getExportFunction("read", "int", ["int", "pointer", "int"]);
+// Define libc/syscalls safely
+const open = getExportFunction("open", "int", ["pointer", "int", "int"]);
+const close = getExportFunction("close", "int", ["int"]);
+const lseek = getExportFunction("lseek", "int", ["int", "int", "int"]);
+const read = getExportFunction("read", "int", ["int", "pointer", "int"]);
+
+
 /* Some variables and functions for elf parsing */
 
 /* Parsing elf function */
@@ -692,57 +696,80 @@ function parseMachO(base) {
 /* Parsing MachO function */
 
 /* Hook flutter engine function to capture the network traffic */
+// Hooking logic
 function hook(target) {
-    if (target == "GetSockAddr") {
-        // Hook SocketAddress::GetSockAddr function so we can get the address of sockaddr structure
+    if (target === "GetSockAddr") {
+        if (!GetSockAddr_func_addr) {
+            console.log("[-] GetSockAddr_func_addr is null");
+            return;
+        }
+
+        // Hook GetSockAddr
         Interceptor.attach(GetSockAddr_func_addr, {
             onEnter: function (args) {
-                // console.log(`[!] sockaddr: ${args[1]}`);
                 sockaddr = args[1];
+                // console.log(`[!] sockaddr: ${sockaddr}`);
             },
             onLeave: function (retval) { }
-        })
-        // Hook the socket function and replace the IP and port with our burp ones.
-        Interceptor.attach(Module.findExportByName(null, "socket"), {
-            onEnter: function (args) {
-                // AF_INET(IPv4) == 2, AF_INET6(IPv6) == 10
-                var overwrite = false;
-                if (Process.platform === 'linux' && sockaddr != null && ptr(sockaddr).readU16() == 2) {
-                    overwrite = true;
-                }
-                else if (Process.platform === 'darwin' && sockaddr != null && ptr(sockaddr).add(0x1).readU8() == 2) {
-                    overwrite = true;
-                }
+        });
 
-                if (overwrite) {
-                    console.log(`[*] Overwrite sockaddr as our burp proxy ip and port --> ${BURP_PROXY_IP}:${BURP_PROXY_PORT}`);
-                    ptr(sockaddr).add(0x2).writeU16(byteFlip(BURP_PROXY_PORT));
-                    ptr(sockaddr).add(0x4).writeByteArray(convertIpToByteArray(BURP_PROXY_IP));
-                }
-            },
-            onLeave: function (retval) { }
-        })
+        // Hook socket()
+        const socketPtr = Module.getExportByName(null, "socket");
+        if (!socketPtr.isNull()) {
+            Interceptor.attach(socketPtr, {
+                onEnter: function (args) {
+                    var overwrite = false;
+
+                    if (Process.platform === 'linux' && sockaddr && ptr(sockaddr).readU16() === 2) {
+                        overwrite = true;
+                    } else if (Process.platform === 'darwin' && sockaddr && ptr(sockaddr).add(1).readU8() === 2) {
+                        overwrite = true;
+                    }
+
+                    if (overwrite) {
+                        console.log(`[*] Overwriting sockaddr with Burp IP and port --> ${BURP_PROXY_IP}:${BURP_PROXY_PORT}`);
+                        ptr(sockaddr).add(2).writeU16(byteFlip(BURP_PROXY_PORT));
+                        ptr(sockaddr).add(4).writeByteArray(convertIpToByteArray(BURP_PROXY_IP));
+                    }
+                },
+                onLeave: function (retval) { }
+            });
+        } else {
+            console.log("[-] socket export not found");
+        }
     }
-    else if (target == "verifyCertChain") {
-        // Hook the verify_cert_chain function and replace the return value with true, so we can capture ssl traffic
+
+    else if (target === "verifyCertChain") {
+        if (!verify_cert_chain_func_addr) {
+            console.log("[-] verify_cert_chain_func_addr is null");
+            return;
+        }
+
         Interceptor.attach(verify_cert_chain_func_addr, {
             onEnter: function (args) { },
             onLeave: function (retval) {
-                if (retval == "0x0") {
-                    console.log(`[*] verify cert bypass`);
-                    var newretval = ptr(0x1);
-                    retval.replace(newretval);
+                if (retval.isNull()) {
+                    console.log(`[*] verifyCertChain bypass`);
+                    retval.replace(ptr(1));
                 }
             }
-        })
+        });
     }
-    else if (target == "verifyPeerCert") {
-        // Hook the verify_peer_cert function and replace it, so we can capture ssl traffic
-        // https://github.com/NVISOsecurity/disable-flutter-tls-verification/blob/ecc6e9ed9e1182645b32da68d7be6aefb2b7e970/disable-flutter-tls.js#L151
+
+    else if (target === "verifyPeerCert") {
+        if (!verify_peer_cert_func_addr) {
+            console.log("[-] verify_peer_cert_func_addr is null");
+            return;
+        }
+
         Interceptor.replace(verify_peer_cert_func_addr, new NativeCallback((pathPtr, flags) => {
-            console.log(`[*] verify peer cert bypass`);
+            console.log(`[*] verifyPeerCert bypass`);
             return 0;
         }, 'int', ['pointer', 'int']));
+    }
+
+    else {
+        console.log(`[-] Unknown hook target: ${target}`);
     }
 }
 /* Hook flutter engine function to capture the network traffic */
@@ -754,14 +781,14 @@ if (target_flutter_library != null) {
         var module_loaded = 0;
         var base = null;
         var int = setInterval(function () {
-            Process.enumerateModulesSync()
+            Process.enumerateModules()
                 .filter(function (m) { return m['path'].indexOf(target_flutter_library) != -1; })
                 .forEach(function (m) {
                     if (ObjC.available) {
                         target_flutter_library = target_flutter_library.split('/').pop();
                     }
                     console.log(`[*] ${target_flutter_library} loaded!`);
-                    base = Module.findBaseAddress(target_flutter_library);
+                    base = Process.getModuleByName(target_flutter_library).base;
                     return module_loaded = 1;
                 })
             if (module_loaded) {
@@ -835,7 +862,6 @@ if (target_flutter_library != null) {
     awaitForCondition(init);
 }
 /* main */
-
 """
 
 # --- UI Layout (Beautiful & Responsive) ---
